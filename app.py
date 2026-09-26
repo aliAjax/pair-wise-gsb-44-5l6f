@@ -16,7 +16,22 @@ ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = ROOT / "privacy_requests.db"
 REQUEST_TYPES = {"access", "correction", "deletion", "withdraw_consent", "restriction"}
 OPEN_STATUSES = {"received", "verifying", "processing", "extended", "response_ready"}
-FINAL_STATUSES = {"fulfilled", "rejected", "duplicate"}
+FINAL_STATUSES = {"fulfilled", "rejected", "duplicate", "withdrawn"}
+WITHDRAWAL_PENDING_STATUS = "withdrawal_pending"
+DIRECT_WITHDRAW_STATUSES = {"received", "verifying", "processing"}
+REVIEW_WITHDRAW_STATUSES = {"extended", "response_ready"}
+WITHDRAWAL_PARTIES = {"self", "guardian", "authorized_agent"}
+REQUEST_ADDED_COLUMNS = [
+    ("withdrawal_reason", "TEXT"),
+    ("withdrawal_party", "TEXT"),
+    ("withdrawn_by", "TEXT"),
+    ("withdrawal_requested_at", "TEXT"),
+    ("previous_status", "TEXT"),
+    ("withdrawal_reviewed_by", "TEXT"),
+    ("withdrawal_reviewed_at", "TEXT"),
+    ("withdrawal_review_note", "TEXT"),
+    ("closed_at", "TEXT"),
+]
 
 
 class DomainError(Exception):
@@ -109,6 +124,15 @@ class PrivacyRequestService:
                     assigned_to TEXT,
                     denial_reason TEXT,
                     response_summary TEXT,
+                    withdrawal_reason TEXT,
+                    withdrawal_party TEXT,
+                    withdrawn_by TEXT,
+                    withdrawal_requested_at TEXT,
+                    previous_status TEXT,
+                    withdrawal_reviewed_by TEXT,
+                    withdrawal_reviewed_at TEXT,
+                    withdrawal_review_note TEXT,
+                    closed_at TEXT,
                     created_by TEXT NOT NULL,
                     version INTEGER NOT NULL DEFAULT 1,
                     updated_at TEXT NOT NULL
@@ -142,6 +166,10 @@ class PrivacyRequestService:
                 CREATE INDEX IF NOT EXISTS idx_requests_subject ON requests(subject_id,request_type,submitted_at);
                 """
             )
+            existing = {row["name"] for row in conn.execute("PRAGMA table_info(requests)")}
+            for name, ddl in REQUEST_ADDED_COLUMNS:
+                if name not in existing:
+                    conn.execute("ALTER TABLE requests ADD COLUMN %s %s" % (name, ddl))
 
     def _audit(self, conn: sqlite3.Connection, request_id: int | None, actor: str,
                action: str, details: dict[str, Any]) -> None:
@@ -454,6 +482,111 @@ class PrivacyRequestService:
             self._audit(conn, request_id, actor, "request.rejected", {"reason": reason.strip()})
             return dict(self._request(conn, request_id))
 
+    def _can_withdraw(self, actor: str, role: str, req: sqlite3.Row) -> None:
+        if role == "supervisor":
+            return
+        if role == "privacy_officer" and req["assigned_to"] == actor:
+            return
+        if role == "intake" and req["created_by"] == actor:
+            return
+        raise DomainError("只有创建该请求的受理人员或被指派的隐私处理人员可以登记撤回", 403)
+
+    def withdraw_request(self, actor: str, role: str, request_id: int, reason: str,
+                         expected_version: int, withdrawn_by_party: str | None = None) -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"intake", "privacy_officer", "supervisor"}, "登记撤回")
+        reason = (reason or "").strip()
+        if not reason:
+            raise DomainError("撤回原因不能为空")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            req = self._request(conn, request_id)
+            self._can_withdraw(actor, role, req)
+            party = (withdrawn_by_party or "").strip().lower() or req["requester_kind"]
+            if party not in WITHDRAWAL_PARTIES:
+                raise DomainError("撤回方类型无效")
+            if req["status"] in DIRECT_WITHDRAW_STATUSES:
+                new_status, previous, needs_review = "withdrawn", None, False
+            elif req["status"] in REVIEW_WITHDRAW_STATUSES:
+                new_status, previous, needs_review = WITHDRAWAL_PENDING_STATUS, req["status"], True
+            else:
+                raise DomainError("当前请求不能撤回", 409)
+            if req["version"] != int(expected_version):
+                raise DomainError("请求已变化，请刷新后重试", 409)
+            now = utcnow()
+            if needs_review:
+                conn.execute(
+                    """UPDATE requests SET status=?,previous_status=?,withdrawal_reason=?,withdrawal_party=?,withdrawn_by=?,
+                       withdrawal_requested_at=?,version=version+1,updated_at=? WHERE id=? AND version=?""",
+                    (new_status, previous, reason, party, actor, now, now, request_id, expected_version),
+                )
+                self._audit(conn, request_id, actor, "request.withdraw_requested",
+                            {"reason": reason, "party": party, "previous_status": previous})
+            else:
+                conn.execute(
+                    """UPDATE requests SET status=?,withdrawal_reason=?,withdrawal_party=?,withdrawn_by=?,
+                       withdrawal_requested_at=?,closed_at=?,previous_status=NULL,withdrawal_reviewed_by=NULL,
+                       withdrawal_reviewed_at=NULL,version=version+1,updated_at=? WHERE id=? AND version=?""",
+                    (new_status, reason, party, actor, now, now, now, request_id, expected_version),
+                )
+                self._audit(conn, request_id, actor, "request.withdrawn", {"reason": reason, "party": party})
+            return self._withdrawal_view(dict(self._request(conn, request_id)))
+
+    def review_withdrawal(self, actor: str, role: str, request_id: int, approved: bool,
+                          expected_version: int, note: str = "") -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"supervisor"}, "复核撤回")
+        note = (note or "").strip()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            req = self._request(conn, request_id)
+            if req["status"] != WITHDRAWAL_PENDING_STATUS:
+                raise DomainError("当前请求没有待复核的撤回", 409)
+            if req["version"] != int(expected_version):
+                raise DomainError("请求已变化，请刷新后重试", 409)
+            now = utcnow()
+            if bool(approved):
+                conn.execute(
+                    """UPDATE requests SET status='withdrawn',withdrawal_reviewed_by=?,withdrawal_reviewed_at=?,
+                       withdrawal_review_note=?,closed_at=?,version=version+1,updated_at=? WHERE id=? AND version=?""",
+                    (actor, now, note or None, now, now, request_id, expected_version),
+                )
+                self._audit(conn, request_id, actor, "request.withdrawal_approved", {"note": note})
+            else:
+                if not note:
+                    raise DomainError("驳回撤回必须填写复核意见")
+                conn.execute(
+                    """UPDATE requests SET status=previous_status,previous_status=NULL,withdrawal_reviewed_by=?,
+                       withdrawal_reviewed_at=?,withdrawal_review_note=?,version=version+1,updated_at=? WHERE id=? AND version=?""",
+                    (actor, now, note, now, request_id, expected_version),
+                )
+                self._audit(conn, request_id, actor, "request.withdrawal_rejected",
+                            {"note": note, "restored_status": req["previous_status"]})
+            return self._withdrawal_view(dict(self._request(conn, request_id)))
+
+    @staticmethod
+    def _withdrawal_view(item: dict[str, Any]) -> dict[str, Any]:
+        """补充撤回关闭信息：关闭原因、复核人、可重新申请状态。"""
+        if item["status"] == "withdrawn":
+            closure_reason = "申请人撤回：%s" % (item.get("withdrawal_reason") or "")
+            reappliable = True
+        elif item["status"] == "rejected":
+            closure_reason = "拒绝：%s" % (item.get("denial_reason") or "")
+            reappliable = False
+        elif item["status"] == "duplicate":
+            closure_reason = "重复请求"
+            reappliable = False
+        elif item["status"] == "fulfilled":
+            closure_reason = "已完成"
+            reappliable = False
+        else:
+            closure_reason = None
+            reappliable = False
+        item["closure_reason"] = closure_reason
+        item["reviewed_by"] = item.get("withdrawal_reviewed_by")
+        item["reappliable"] = reappliable
+        return item
+
     def _visibility(self, actor: str, role: str, conn: sqlite3.Connection) -> list[sqlite3.Row]:
         if role in {"supervisor", "auditor"}:
             return conn.execute("SELECT * FROM requests ORDER BY due_date,id").fetchall()
@@ -477,7 +610,7 @@ class PrivacyRequestService:
                 raise DomainError("无权查看该权利请求", 403)
             locations = [dict(r) for r in conn.execute("SELECT * FROM data_locations WHERE request_id=? ORDER BY id", (request_id,)).fetchall()]
             timeline = [dict(r) for r in conn.execute("SELECT * FROM timeline WHERE request_id=? ORDER BY id", (request_id,)).fetchall()]
-            return {"request": dict(req), "locations": locations, "timeline": timeline}
+            return {"request": self._withdrawal_view(dict(req)), "locations": locations, "timeline": timeline}
 
     def queue(self, actor: str, role: str) -> list[dict[str, Any]]:
         with self.connect() as conn:
@@ -485,7 +618,7 @@ class PrivacyRequestService:
         now = datetime.now(timezone.utc)
         result = []
         for row in rows:
-            item = dict(row)
+            item = self._withdrawal_view(dict(row))
             item["overdue"] = parse_time(item["due_date"]) < now and item["status"] in OPEN_STATUSES
             result.append(item)
         return result
@@ -496,7 +629,7 @@ class PrivacyRequestService:
             requests = []
             locations = []
             for row in rows:
-                item = dict(row)
+                item = self._withdrawal_view(dict(row))
                 item["overdue"] = parse_time(item["due_date"]) < datetime.now(timezone.utc) and item["status"] in OPEN_STATUSES
                 requests.append(item)
                 locations.extend(dict(r) for r in conn.execute("SELECT * FROM data_locations WHERE request_id=? ORDER BY id", (row["id"],)).fetchall())
@@ -594,6 +727,10 @@ class ApiHandler(BaseHTTPRequestHandler):
                 result = self.service.fulfill_request(actor, role, **data)
             elif path == "/api/requests/reject":
                 result = self.service.reject_request(actor, role, **data)
+            elif path == "/api/requests/withdraw":
+                result = self.service.withdraw_request(actor, role, **data)
+            elif path == "/api/requests/withdrawals/review":
+                result = self.service.review_withdrawal(actor, role, **data)
             else:
                 raise DomainError("接口不存在", 404)
             self._send(201, result)

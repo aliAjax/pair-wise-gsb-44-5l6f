@@ -25,6 +25,8 @@ python3 app.py
 - `POST /api/locations`、`POST /api/locations/classify`：多系统定位和第三方/保留分类
 - `POST /api/requests/extend`、`POST /api/requests/prepare`
 - `POST /api/requests/fulfill`、`POST /api/requests/reject`
+- `POST /api/requests/withdraw`：申请人或代理说明原因撤回。尚未准备回复（received/verifying/processing）的案件直接关闭；已备妥回复或延期中（response_ready/extended）的案件转为待复核
+- `POST /api/requests/withdrawals/review`：主管复核待撤回案件，批准后关闭（可驳回并恢复原状态）。撤回后保留原请求、处理人和数据位置，已撤回案件不再参与30天重复判定，详情返回关闭原因、复核人和可重新申请状态
 
 ## 测试
 
@@ -32,7 +34,7 @@ python3 app.py
 python3 -m unittest discover -s tests -v
 ```
 
-测试覆盖完整查阅请求、第三方遮蔽、未成年人/代理限制、重复与幂等、延期上限、删除法律保留、权限拒绝和版本冲突。
+测试覆盖完整查阅请求、第三方遮蔽、未成年人/代理限制、重复与幂等、延期上限、删除法律保留、权限拒绝、版本冲突，以及撤回直接关闭、主管复核、撤回后不判重复。
 
 ## 局限
 
