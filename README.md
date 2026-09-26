@@ -25,6 +25,12 @@ python3 app.py
 - `POST /api/locations`、`POST /api/locations/classify`：多系统定位和第三方/保留分类
 - `POST /api/requests/extend`、`POST /api/requests/prepare`
 - `POST /api/requests/fulfill`、`POST /api/requests/reject`
+- `POST /api/requests/withdraw`：申请人或代理说明原因撤回请求
+- `POST /api/requests/withdraw/review`：主管复核撤回申请
+
+## 撤回流程
+
+申请人或代理说明原因后登记撤回：尚未准备回复（received/verifying/processing）的案件直接关闭为 `withdrawn`；已准备回复（response_ready）或延期中（extended）的案件先进入 `withdrawal_pending`，由主管复核，通过后关闭，驳回则恢复原状态继续办理。撤回只改状态，原请求、处理人和数据位置全部保留，不再占用待办队列；同一主体再次提交同类请求时，已撤回的案件不参与重复判定。请求详情返回关闭原因（`withdrawal_reason`）、复核人（`withdrawal_reviewed_by`）和可重新申请状态（`can_reapply`）。
 
 ## 测试
 
@@ -32,7 +38,7 @@ python3 app.py
 python3 -m unittest discover -s tests -v
 ```
 
-测试覆盖完整查阅请求、第三方遮蔽、未成年人/代理限制、重复与幂等、延期上限、删除法律保留、权限拒绝和版本冲突。
+测试覆盖完整查阅请求、第三方遮蔽、未成年人/代理限制、重复与幂等、延期上限、删除法律保留、权限拒绝、版本冲突和撤回复核。
 
 ## 局限
 
